@@ -1,0 +1,28 @@
+api_id: 123456
+api_hash: replace_with_api_hash
+bot_token: ""
+
+chat:
+  - chat_id: replace_with_chat_id
+    last_read_message_id: 0
+    download_filter: ""
+
+ids_to_retry: []
+media_types:
+  - video
+file_formats:
+  video:
+    - all
+
+save_path: ./downloads
+file_path_prefix:
+  - chat_title
+  - media_datetime
+  - media_type
+
+max_download_task: 5
+request_timeout: 60
+start_timeout: 60
+web_host: 127.0.0.1
+web_port: 5000
+language: ZH
