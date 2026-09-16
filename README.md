@@ -20,14 +20,9 @@
 > After running, open a browser and visit `localhost:5000`
 > If it is a remote machine, you need to configure web_host: 0.0.0.0
 
-
-<img alt="Code style: black" style="width:100%; high:60%;" src="./screenshot/web_ui.gif"/>
-
 ### Robot
 
 > Need to configure `bot_token` before using the robot mode.
-
-<img alt="Code style: black" style="width:60%; high:30%; " src="./screenshot/bot.gif"/>
 
 ### Support
 
