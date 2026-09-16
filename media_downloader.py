@@ -28,7 +28,7 @@ from module.pyrogram_extension import (
     upload_telegram_chat,
 )
 from module.web import init_web
-from utils.format import truncate_filename, validate_title
+from utils.format import to_beijing_datetime, truncate_filename, validate_title
 from utils.log import LogFilter
 from utils.meta import print_meta
 from utils.meta_data import MetaData
@@ -47,6 +47,8 @@ app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
 
 queue: asyncio.Queue = asyncio.Queue()
 RETRY_TIME_OUT = 3
+MAX_DOWNLOAD_RETRIES = 3
+MAX_DOWNLOAD_FLOOD_WAIT = 5 * 60
 
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
@@ -81,6 +83,28 @@ def _check_download_finish(media_size: int, download_path: str, ui_file_name: st
         raise pyrogram.errors.exceptions.bad_request_400.BadRequest()
 
 
+def _cleanup_download_cache(
+    temp_file_name: Optional[str], temp_download_path: Optional[str]
+):
+    """Remove resume files after a complete file has been moved."""
+    cache_paths = {path for path in (temp_file_name, temp_download_path) if path}
+    if temp_file_name:
+        cache_paths.add(f"{temp_file_name}.temp")
+
+    for cache_path in cache_paths:
+        if not os.path.isfile(cache_path):
+            continue
+
+        try:
+            os.remove(cache_path)
+        except OSError as error:
+            logger.warning(
+                "Failed to remove temporary download cache {}: {}",
+                cache_path,
+                error,
+            )
+
+
 def _move_to_download_path(temp_download_path: str, download_path: str):
     """Move file to download path
 
@@ -111,7 +135,7 @@ def _check_timeout(retry: int, _: int):
         Try to download message 's id
 
     """
-    if retry == 2:
+    if retry >= MAX_DOWNLOAD_RETRIES - 1:
         return True
     return False
 
@@ -160,6 +184,12 @@ def _is_exist(file_path: str) -> bool:
     return not os.path.isdir(file_path) and os.path.exists(file_path)
 
 
+def _get_datetime_dir_name(value) -> str:
+    """Format a media date as a Beijing-time directory name."""
+    beijing_datetime = to_beijing_datetime(value)
+    return beijing_datetime.strftime(app.date_format) if beijing_datetime else "0"
+
+
 # pylint: disable = R0912
 
 
@@ -195,19 +225,18 @@ async def _get_media_meta(
     if message.chat and message.chat.title:
         dirname = validate_title(f"{message.chat.title}")
 
-    if message.date:
-        datetime_dir_name = message.date.strftime(app.date_format)
-    else:
-        datetime_dir_name = "0"
+    datetime_dir_name = _get_datetime_dir_name(message.date)
 
     if _type in ["voice", "video_note"]:
         # pylint: disable = C0209
         file_format = media_obj.mime_type.split("/")[-1]  # type: ignore
         file_save_path = app.get_file_save_path(_type, dirname, datetime_dir_name)
+        media_datetime = to_beijing_datetime(getattr(media_obj, "date", None))
+        media_datetime_name = media_datetime.isoformat() if media_datetime else "0"
         file_name = "{} - {}_{}.{}".format(
             message.id,
             _type,
-            media_obj.date.isoformat(),  # type: ignore
+            media_datetime_name,
             file_format,
         )
         file_name = validate_title(file_name)
@@ -276,7 +305,7 @@ async def save_msg_to_file(
     dirname = validate_title(
         message.chat.title if message.chat and message.chat.title else str(chat_id)
     )
-    datetime_dir_name = message.date.strftime(app.date_format) if message.date else "0"
+    datetime_dir_name = _get_datetime_dir_name(message.date)
 
     file_save_path = app.get_file_save_path("msg", dirname, datetime_dir_name)
     file_name = os.path.join(
@@ -414,7 +443,10 @@ async def download_media(
             if _can_download(_type, file_formats, file_format):
                 if _is_exist(file_name):
                     file_size = os.path.getsize(file_name)
-                    if file_size or file_size == media_size:
+                    if file_size > 0 and (
+                        media_size == 0 or file_size == media_size
+                    ):
+                        _cleanup_download_cache(temp_file_name, None)
                         logger.info(
                             f"id={message.id} {ui_file_name} "
                             f"{_t('already download,download skipped')}.\n"
@@ -437,7 +469,7 @@ async def download_media(
 
     message_id = message.id
 
-    for retry in range(3):
+    for retry in range(MAX_DOWNLOAD_RETRIES):
         try:
             temp_download_path = await client.download_media(
                 message,
@@ -456,35 +488,62 @@ async def download_media(
                 _check_download_finish(media_size, temp_download_path, ui_file_name)
                 await asyncio.sleep(0.5)
                 _move_to_download_path(temp_download_path, file_name)
-                # TODO: if not exist file size or media
+                _cleanup_download_cache(temp_file_name, temp_download_path)
                 return DownloadStatus.SuccessDownload, file_name
         except pyrogram.errors.exceptions.bad_request_400.BadRequest:
+            if _check_timeout(retry, message.id):
+                logger.error(
+                    f"Message[{message.id}]: "
+                    f"{_t('file reference expired for 3 retries, download skipped.')}"
+                )
+                break
+
             logger.warning(
                 f"Message[{message.id}]: {_t('file reference expired, refetching')}..."
             )
             await asyncio.sleep(RETRY_TIME_OUT)
             message = await fetch_message(client, message)
-            if _check_timeout(retry, message.id):
-                # pylint: disable = C0301
+        except (
+            pyrogram.errors.exceptions.flood_420.FloodWait,
+            pyrogram.errors.exceptions.flood_420.FloodPremiumWait,
+        ) as wait_err:
+            wait_seconds = int(getattr(wait_err, "value", 0) or 0)
+            if wait_seconds > MAX_DOWNLOAD_FLOOD_WAIT:
                 logger.error(
-                    f"Message[{message.id}]: "
-                    f"{_t('file reference expired for 3 retries, download skipped.')}"
+                    f"Message[{message.id}]: FloodWait is {wait_seconds} seconds, "
+                    f"exceeding the {MAX_DOWNLOAD_FLOOD_WAIT}-second limit; "
+                    f"download skipped and resume cache kept."
                 )
-        except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
-            await asyncio.sleep(wait_err.value)
-            logger.warning("Message[{}]: FlowWait {}", message.id, wait_err.value)
-            _check_timeout(retry, message.id)
+                break
+
+            if _check_timeout(retry, message.id):
+                logger.error(
+                    f"Message[{message.id}]: download stopped after "
+                    f"{MAX_DOWNLOAD_RETRIES} retries; resume cache kept."
+                )
+                break
+
+            logger.warning(
+                "Message[{}]: FloodWait {}, retrying after wait",
+                message.id,
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
         except (TimeoutError, asyncio.TimeoutError, TypeError):
             # pylint: disable = C0301
+            if _check_timeout(retry, message.id):
+                logger.error(
+                    f"Message[{message.id}]: Timing out after "
+                    f"{MAX_DOWNLOAD_RETRIES} retries, download skipped; "
+                    f"resume cache kept."
+                )
+                break
+
             logger.warning(
                 f"{_t('Timeout Error occurred when downloading Message')}[{message.id}], "
                 f"{_t('retrying after')} {RETRY_TIME_OUT} {_t('seconds')}"
             )
             await asyncio.sleep(RETRY_TIME_OUT)
-            if _check_timeout(retry, message.id):
-                logger.error(
-                    f"Message[{message.id}]: {_t('Timing out after 3 reties, download skipped.')}"
-                )
         except Exception as e:
             # pylint: disable = C0301
             logger.error(
@@ -494,6 +553,10 @@ async def download_media(
             )
             break
 
+    logger.error(
+        f"Message[{message.id}]: download failed after {MAX_DOWNLOAD_RETRIES} "
+        f"attempts; any partial file was kept for a future resume."
+    )
     return DownloadStatus.FailedDownload, None
 
 
@@ -659,6 +722,7 @@ def main():
         start_timeout=app.start_timeout,
         request_timeout=app.request_timeout,
         no_updates=True,
+        hide_password=True,
     )
     try:
         app.pre_run()
