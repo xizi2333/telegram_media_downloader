@@ -46,18 +46,3 @@ conda env create -f environment.yml
 conda activate telegram
 python media_downloader.py
 ```
-
-If the `telegram` environment already exists, install the dependencies with:
-
-```powershell
-conda activate telegram
-python -m pip install -r requirements.txt
-```
-
-## Upgrade installation
-
-```sh
-cd telegram_media_downloader
-conda activate telegram
-python -m pip install -r requirements.txt
-```
