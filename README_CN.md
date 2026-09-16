@@ -20,14 +20,9 @@
 > 运行后打开浏览器访问`localhost:5000`
 > 如果是远程机器需要配置web_host: 0.0.0.0
 
-
-<img alt="Code style: black" style="width:100%; high:60%;" src="./screenshot/web_ui.gif"/>
-
 ### 机器人
 
 > 使用机器人模式前需要配置 `bot_token`。
-
-<img alt="Code style: black" style="width:60%; high:30%; " src="./screenshot/bot.gif"/>
 
 ### 支持
 
